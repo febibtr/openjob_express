@@ -1,6 +1,6 @@
 class ProfileHandler {
   constructor(service) {
-    this._service = service; // Gabungan dari UsersService, JobsService, dll.
+    this._service = service; 
   }
 
   async getMyProfileHandler(req, res, next) {
