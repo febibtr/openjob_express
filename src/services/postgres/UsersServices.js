@@ -1,6 +1,6 @@
 const pool = require('./Pool');
 const bcrypt = require('bcrypt');
-const { nanoid } = require('nanoid'); // npm install nanoid@3
+const { nanoid } = require('nanoid'); 
 
 class UsersService {
   async addUser({ username, password, fullname }) {
