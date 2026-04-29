@@ -6,29 +6,51 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const Joi = require('joi');
-
+const redis = require('redis');
+const amqp = require('amqplib');
 
 const app = express();
 app.use(express.json());
 const pool = new Pool();
 
-// Cek Koneksi
-const checkConn = async () => {
-  try {
-    await pool.query('SELECT NOW()');
-    console.log('✅ Database Terhubung.');
-  } catch (err) {
-    console.error('❌ Gagal Koneksi:', err.message);
-  }
-};
-checkConn();
-
-const RefreshTokenSchema = Joi.object({
-    refreshToken: Joi.string().required()
+// ==========================================
+// KONFIGURASI REDIS (Caching)
+// ==========================================
+const redisClient = redis.createClient({
+    socket: { host: process.env.REDIS_HOST || '127.0.0.1' }
 });
+redisClient.on('error', (err) => console.error('Redis Client Error', err));
+redisClient.connect();
+
+const setCache = async (key, value) => {
+    await redisClient.set(key, JSON.stringify(value), { EX: 3600 });
+};
+const getCache = async (key) => {
+    const data = await redisClient.get(key);
+    return data ? JSON.parse(data) : null;
+};
+const clearCache = async (key) => {
+    await redisClient.del(key);
+};
 
 // ==========================================
-// KONFIGURASI MULTER (Upload Documents)
+// KONFIGURASI RABBITMQ (Message Queue)
+// ==========================================
+let mqChannel;
+const connectRabbitMQ = async () => {
+    try {
+        const connection = await amqp.connect(`amqp://${process.env.RABBITMQ_USER}:${process.env.RABBITMQ_PASSWORD}@${process.env.RABBITMQ_HOST}:${process.env.RABBITMQ_PORT}`);
+        mqChannel = await connection.createChannel();
+        await mqChannel.assertQueue('application_queue', { durable: true });
+        console.log('✅ RabbitMQ Terhubung');
+    } catch (error) {
+        console.error('❌ RabbitMQ Gagal Terhubung:', error.message);
+    }
+};
+connectRabbitMQ();
+
+// ==========================================
+// KONFIGURASI MULTER (Untuk Upload Documents)
 // ==========================================
 const uploadDir = './uploads';
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
@@ -37,11 +59,33 @@ const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, uploadDir),
     filename: (req, file, cb) => cb(null, `doc-${Date.now()}${path.extname(file.originalname)}`)
 });
-const upload = multer({ storage });
+
+const upload = multer({ 
+    storage,
+    limits: { fileSize: 5 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype === 'application/pdf') {
+            cb(null, true);
+        } else {
+            cb(new Error('File is required to be PDF'), false);
+        }
+    }
+});
+
+const uploadMiddleware = (req, res, next) => {
+    upload.single('document')(req, res, (err) => {
+        if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+            return next({ status: 400, message: 'File is required and max size is 5MB' });
+        }
+        if (err) return next({ status: 400, message: err.message });
+        next();
+    });
+};
+
 app.use('/uploads', express.static('uploads'));
 
 // ==========================================
-// VALIDATION (Joi)
+// 1. SCHEMAS VALIDATION (Joi)
 // ==========================================
 const UserSchema = Joi.object({
     name: Joi.string().required(),
@@ -80,7 +124,10 @@ const JobSchema = Joi.object({
     status: Joi.string().optional()
 });
 
-// Middleware Validasi Joi
+const RefreshTokenSchema = Joi.object({
+    refreshToken: Joi.string().required()
+});
+
 const validate = (schema) => {
     return (req, res, next) => {
         const { error } = schema.validate(req.body);
@@ -104,11 +151,10 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
-// ==========================================
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // PUBLIC ENDPOINTS
-// ==========================================
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-// --- USERS ---
 app.post('/users', validate(UserSchema), async (req, res, next) => {
     const { name, email, password, role } = req.body;
     try {
@@ -119,12 +165,21 @@ app.post('/users', validate(UserSchema), async (req, res, next) => {
 });
 
 app.get('/users/:id', async (req, res, next) => {
+    const cacheKey = `users:${req.params.id}`;
+    const cached = await getCache(cacheKey);
+    if (cached) {
+        res.set('X-Data-Source', 'cache');
+        return res.status(200).json({ status: 'success', data: cached });
+    }
+
     const result = await pool.query('SELECT id, name, email, role FROM users WHERE id = $1', [req.params.id]);
     if (!result.rows[0]) return next({ status: 404, message: 'User not found' });
+    
+    await setCache(cacheKey, result.rows[0]);
+    res.set('X-Data-Source', 'database');
     res.status(200).json({ status: 'success', data: result.rows[0] });
 });
 
-// --- AUTHENTICATIONS ---
 app.post('/authentications', validate(AuthSchema), async (req, res, next) => {
     const { email, password } = req.body;
     const result = await pool.query('SELECT id, password FROM users WHERE email = $1', [email]);
@@ -137,10 +192,8 @@ app.post('/authentications', validate(AuthSchema), async (req, res, next) => {
     res.status(200).json({ status: 'success', data: { accessToken, refreshToken } });
 });
 
-app.put('/authentications', async (req, res, next) => {
+app.put('/authentications', validate(RefreshTokenSchema), async (req, res, next) => {
     const { refreshToken } = req.body;
-    if (!refreshToken) return next({ status: 400, message: 'Refresh token diperlukan' });
-    
     const check = await pool.query('SELECT token FROM authentications WHERE token = $1', [refreshToken]);
     if (!check.rows[0]) return next({ status: 400, message: 'Token tidak valid di database' });
     
@@ -151,40 +204,56 @@ app.put('/authentications', async (req, res, next) => {
     } catch (e) { next({ status: 400, message: 'Token kadaluwarsa atau tidak valid' }); }
 });
 
-// --- COMPANIES ---
 app.get('/companies', async (req, res) => {
-    const result = await pool.query('SELECT * FROM companies');
+    const result = await pool.query('SELECT id, name, location, description, owner, created_at FROM companies');
     res.status(200).json({ status: 'success', data: { companies: result.rows } });
 });
+
 app.get('/companies/:id', async (req, res, next) => {
+    const cacheKey = `companies:${req.params.id}`;
+    const cached = await getCache(cacheKey);
+    if (cached) {
+        res.set('X-Data-Source', 'cache');
+        return res.status(200).json({ status: 'success', data: cached });
+    }
+
     const result = await pool.query('SELECT * FROM companies WHERE id = $1', [req.params.id]);
     if (!result.rows[0]) return next({ status: 404, message: 'Not found' });
+    
+    await setCache(cacheKey, result.rows[0]);
+    res.set('X-Data-Source', 'database');
     res.status(200).json({ status: 'success', data: result.rows[0] });
 });
 
-// --- CATEGORIES ---
 app.get('/categories', async (req, res) => {
-    const result = await pool.query('SELECT * FROM categories');
+    const result = await pool.query('SELECT id, name, created_at, updated_at FROM categories');
     res.status(200).json({ status: 'success', data: { categories: result.rows } });
 });
+
 app.get('/categories/:id', async (req, res, next) => {
     const result = await pool.query('SELECT * FROM categories WHERE id = $1', [req.params.id]);
     if (!result.rows[0]) return next({ status: 404, message: 'Not found' });
     res.status(200).json({ status: 'success', data: result.rows[0] });
 });
 
-// --- JOBS ---
 app.get('/jobs', async (req, res) => {
     const { title } = req.query;
     const companyName = req.query['company-name'];
-    let queryText = 'SELECT j.*, c.name as company_name FROM jobs j JOIN companies c ON j.company_id = c.id WHERE 1=1';
+    
+    let queryText = `
+        SELECT j.id, j.company_id, j.category_id, j.title, j.job_type, j.experience_level, 
+               j.location_type, j.location_city, j.salary_min, j.salary_max, j.is_salary_visible, j.status, 
+               c.name as company_name 
+        FROM jobs j JOIN companies c ON j.company_id = c.id WHERE 1=1`;
     let params = [];
+    
     if (title) { params.push(`%${title}%`); queryText += ` AND j.title ILIKE $${params.length}`; }
     if (companyName) { params.push(`%${companyName}%`); queryText += ` AND c.name ILIKE $${params.length}`; }
     
     const result = await pool.query(queryText, params);
     res.status(200).json({ status: 'success', data: { jobs: result.rows } });
 });
+
 app.get('/jobs/:id', async (req, res, next) => {
     const result = await pool.query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!result.rows[0]) return next({ status: 404, message: 'Not found' });
@@ -199,57 +268,78 @@ app.get('/jobs/category/:categoryId', async (req, res) => {
     res.status(200).json({ status: 'success', data: { jobs: result.rows } });
 });
 
-// --- DOCUMENTS (Public) ---
 app.get('/documents', async (req, res) => {
-    const result = await pool.query('SELECT * FROM documents');
+    const result = await pool.query('SELECT id, user_id, filename, url FROM documents');
     res.status(200).json({ status: 'success', data: { documents: result.rows } });
 });
+
 app.get('/documents/:id', async (req, res, next) => {
     const result = await pool.query('SELECT * FROM documents WHERE id = $1', [req.params.id]);
     if (!result.rows[0]) return next({ status: 404, message: 'Not found' });
-    res.status(200).json({ status: 'success', data: result.rows[0] });
+    
+    const document = result.rows[0];
+    const filePath = path.join(process.cwd(), 'uploads', document.filename);
+
+    if (!fs.existsSync(filePath)) {
+        return next({ status: 404, message: 'File fisik tidak ditemukan di: ' + filePath });
+    }
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${document.filename}"`);
+    res.sendFile(filePath);
 });
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// PROTECTED ENDPOINTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-
-// ==========================================
-// PROTECTED ENDPOINTS 
-// ==========================================
-
-// --- PROFILE ---
 app.get('/profile', authenticateToken, async (req, res) => {
     const result = await pool.query('SELECT id, name, email, role FROM users WHERE id = $1', [req.user.id]);
     res.status(200).json({ status: 'success', data: result.rows[0] });
 });
+
 app.get('/profile/applications', authenticateToken, async (req, res) => {
-    const result = await pool.query('SELECT * FROM applications WHERE user_id = $1', [req.user.id]);
+    const query = `
+        SELECT a.id, a.user_id, a.job_id, a.status, 
+               j.category_id, j.title, j.description, j.job_type, j.experience_level, 
+               j.location_type, j.location_city, j.salary_min, j.salary_max, j.is_salary_visible, 
+               c.name as company_name 
+        FROM applications a 
+        JOIN jobs j ON a.job_id = j.id 
+        JOIN companies c ON j.company_id = c.id 
+        WHERE a.user_id = $1`;
+        
+    const result = await pool.query(query, [req.user.id]);
     res.status(200).json({ status: 'success', data: { applications: result.rows } });
 });
+
 app.get('/profile/bookmarks', authenticateToken, async (req, res) => {
     const result = await pool.query('SELECT * FROM bookmarks WHERE user_id = $1', [req.user.id]);
     res.status(200).json({ status: 'success', data: { bookmarks: result.rows } });
 });
 
-// --- COMPANIES ---
 app.post('/companies', authenticateToken, validate(CompanySchema), async (req, res) => {
     const { name, location, description } = req.body;
     const id = `company-${Date.now()}`;
     await pool.query('INSERT INTO companies VALUES($1, $2, $3, $4, $5)', [id, name, location, description, req.user.id]);
     res.status(201).json({ status: 'success', data: { id } });
 });
+
 app.put('/companies/:id', authenticateToken, validate(CompanySchema), async (req, res, next) => {
     const check = await pool.query('SELECT id FROM companies WHERE id = $1', [req.params.id]);
     if (!check.rows[0]) return next({ status: 404, message: 'Not found' });
     await pool.query('UPDATE companies SET name = $1, location = $2, description = $3 WHERE id = $4', [req.body.name, req.body.location, req.body.description, req.params.id]);
+    await clearCache(`companies:${req.params.id}`);
     res.status(200).json({ status: 'success', message: 'Updated' });
 });
+
 app.delete('/companies/:id', authenticateToken, async (req, res, next) => {
     const check = await pool.query('SELECT id FROM companies WHERE id = $1', [req.params.id]);
     if (!check.rows[0]) return next({ status: 404, message: 'Not found' });
     await pool.query('DELETE FROM companies WHERE id = $1', [req.params.id]);
+    await clearCache(`companies:${req.params.id}`);
     res.status(200).json({ status: 'success', message: 'Deleted' });
 });
 
-// --- CATEGORIES ---
 app.post('/categories', authenticateToken, validate(CategorySchema), async (req, res) => {
     const id = `cat-${Date.now()}`;
     await pool.query('INSERT INTO categories VALUES($1, $2)', [id, req.body.name]);
@@ -268,22 +358,27 @@ app.delete('/categories/:id', authenticateToken, async (req, res, next) => {
     res.status(200).json({ status: 'success', message: 'Deleted' });
 });
 
-// --- JOBS ---
-app.post('/jobs', authenticateToken, validate(JobSchema), async (req, res) => {
+app.post('/jobs', authenticateToken, validate(JobSchema), async (req, res, next) => {
     const { company_id, category_id, title, description, job_type, experience_level, location_type, location_city, salary_min, salary_max, is_salary_visible, status } = req.body;
+    
+    const compCheck = await pool.query('SELECT id FROM companies WHERE id = $1', [company_id]);
+    if (!compCheck.rows[0]) return next({ status: 404, message: 'Company not found' });
+    
     const id = `job-${Date.now()}`;
     await pool.query(
-        'INSERT INTO jobs VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)', 
+        'INSERT INTO jobs (id, company_id, category_id, title, description, job_type, experience_level, location_type, location_city, salary_min, salary_max, is_salary_visible, status) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)', 
         [id, company_id, category_id, title, description, job_type, experience_level, location_type, location_city, salary_min, salary_max, is_salary_visible, status || 'open']
     );
     res.status(201).json({ status: 'success', data: { id } });
 });
+
 app.put('/jobs/:id', authenticateToken, async (req, res, next) => {
     const check = await pool.query('SELECT id FROM jobs WHERE id = $1', [req.params.id]);
     if (!check.rows[0]) return next({ status: 404, message: 'Not found' });
     await pool.query('UPDATE jobs SET title = $1, description = $2, salary_max = $3 WHERE id = $4', [req.body.title, req.body.description, req.body.salary_max, req.params.id]);
     res.status(200).json({ status: 'success', message: 'Updated' });
 });
+
 app.delete('/jobs/:id', authenticateToken, async (req, res, next) => {
     const check = await pool.query('SELECT id FROM jobs WHERE id = $1', [req.params.id]);
     if (!check.rows[0]) return next({ status: 404, message: 'Not found' });
@@ -291,100 +386,195 @@ app.delete('/jobs/:id', authenticateToken, async (req, res, next) => {
     res.status(200).json({ status: 'success', message: 'Deleted' });
 });
 
-// --- APPLICATIONS ---
-app.post('/applications', authenticateToken, async (req, res) => {
+app.post('/applications', authenticateToken, async (req, res, next) => {
     const { job_id } = req.body;
+    
+    const jobCheck = await pool.query('SELECT id FROM jobs WHERE id = $1', [job_id]);
+    if (!jobCheck.rows[0]) return next({ status: 404, message: 'Job not found' });
+
+    const duplicateCheck = await pool.query('SELECT id FROM applications WHERE job_id = $1 AND user_id = $2', [job_id, req.user.id]);
+    if (duplicateCheck.rows[0]) return next({ status: 400, message: 'Application already exists' });
+
     const id = `app-${Date.now()}`;
     await pool.query('INSERT INTO applications(id, job_id, user_id) VALUES($1, $2, $3)', [id, job_id, req.user.id]);
-    res.status(201).json({ status: 'success', data: { id } });
+    
+    await clearCache(`applications:user:${req.user.id}`);
+    await clearCache(`applications:job:${job_id}`);
+
+    if (mqChannel) {
+        mqChannel.sendToQueue('application_queue', Buffer.from(JSON.stringify({ application_id: id })));
+    }
+
+    res.status(201).json({ status: 'success', data: { id, job_id, user_id: req.user.id, status: 'pending' } });
 });
+
 app.get('/applications', authenticateToken, async (req, res) => {
-    const result = await pool.query('SELECT * FROM applications');
+    const query = `
+        SELECT a.id, a.user_id, a.job_id, a.status, 
+               j.title, j.job_type, j.experience_level, j.location_type, j.location_city, 
+               j.salary_min, j.salary_max, j.is_salary_visible, j.category_id
+        FROM applications a 
+        JOIN jobs j ON a.job_id = j.id`;
+    const result = await pool.query(query);
     res.status(200).json({ status: 'success', data: { applications: result.rows } });
 });
+
 app.get('/applications/:id', authenticateToken, async (req, res, next) => {
+    const cacheKey = `applications:${req.params.id}`;
+    const cached = await getCache(cacheKey);
+    if (cached) {
+        res.set('X-Data-Source', 'cache');
+        return res.status(200).json({ status: 'success', data: cached });
+    }
+
     const result = await pool.query('SELECT * FROM applications WHERE id = $1', [req.params.id]);
     if (!result.rows[0]) return next({ status: 404, message: 'Not found' });
+
+    await setCache(cacheKey, result.rows[0]);
+    res.set('X-Data-Source', 'database');
     res.status(200).json({ status: 'success', data: result.rows[0] });
 });
+
 app.get('/applications/user/:userId', authenticateToken, async (req, res) => {
+    const cacheKey = `applications:user:${req.params.userId}`;
+    const cached = await getCache(cacheKey);
+    if (cached) {
+        res.set('X-Data-Source', 'cache');
+        return res.status(200).json({ status: 'success', data: { applications: cached } });
+    }
+
     const result = await pool.query('SELECT * FROM applications WHERE user_id = $1', [req.params.userId]);
+    await setCache(cacheKey, result.rows);
+    res.set('X-Data-Source', 'database');
     res.status(200).json({ status: 'success', data: { applications: result.rows } });
 });
+
 app.get('/applications/job/:jobId', authenticateToken, async (req, res) => {
+    const cacheKey = `applications:job:${req.params.jobId}`;
+    const cached = await getCache(cacheKey);
+    if (cached) {
+        res.set('X-Data-Source', 'cache');
+        return res.status(200).json({ status: 'success', data: { applications: cached } });
+    }
+
     const result = await pool.query('SELECT * FROM applications WHERE job_id = $1', [req.params.jobId]);
+    await setCache(cacheKey, result.rows);
+    res.set('X-Data-Source', 'database');
     res.status(200).json({ status: 'success', data: { applications: result.rows } });
 });
+
 app.put('/applications/:id', authenticateToken, async (req, res, next) => {
-    const check = await pool.query('SELECT id FROM applications WHERE id = $1', [req.params.id]);
-    if (!check.rows[0]) return next({ status: 404, message: 'Not found' });
+    const appInfo = await pool.query('SELECT user_id, job_id FROM applications WHERE id = $1', [req.params.id]);
+    if (!appInfo.rows[0]) return next({ status: 404, message: 'Not found' });
+
     await pool.query('UPDATE applications SET status = $1 WHERE id = $2', [req.body.status, req.params.id]);
+    
+    await clearCache(`applications:${req.params.id}`);
+    await clearCache(`applications:user:${appInfo.rows[0].user_id}`);
+    await clearCache(`applications:job:${appInfo.rows[0].job_id}`);
+
     res.status(200).json({ status: 'success', message: 'Updated' });
 });
+
 app.delete('/applications/:id', authenticateToken, async (req, res, next) => {
-    const check = await pool.query('SELECT id FROM applications WHERE id = $1', [req.params.id]);
-    if (!check.rows[0]) return next({ status: 404, message: 'Not found' });
+    const appInfo = await pool.query('SELECT user_id, job_id FROM applications WHERE id = $1', [req.params.id]);
+    if (!appInfo.rows[0]) return next({ status: 404, message: 'Not found' });
+
     await pool.query('DELETE FROM applications WHERE id = $1', [req.params.id]);
+
+    await clearCache(`applications:${req.params.id}`);
+    await clearCache(`applications:user:${appInfo.rows[0].user_id}`);
+    await clearCache(`applications:job:${appInfo.rows[0].job_id}`);
+
     res.status(200).json({ status: 'success', message: 'Deleted' });
 });
 
-// --- BOOKMARKS ---
 app.post('/jobs/:jobId/bookmark', authenticateToken, async (req, res) => {
     const id = `bm-${Date.now()}`;
     await pool.query('INSERT INTO bookmarks VALUES($1, $2, $3)', [id, req.user.id, req.params.jobId]);
+    await clearCache(`bookmarks:user:${req.user.id}`);
     res.status(201).json({ status: 'success', data: { id } });
 });
+
 app.get('/jobs/:jobId/bookmark/:id', authenticateToken, async (req, res, next) => {
     const result = await pool.query('SELECT * FROM bookmarks WHERE id = $1 AND job_id = $2', [req.params.id, req.params.jobId]);
     if (!result.rows[0]) return next({ status: 404, message: 'Not found' });
     res.status(200).json({ status: 'success', data: result.rows[0] });
 });
+
 app.delete('/jobs/:jobId/bookmark', authenticateToken, async (req, res) => {
     await pool.query('DELETE FROM bookmarks WHERE user_id = $1 AND job_id = $2', [req.user.id, req.params.jobId]);
+    await clearCache(`bookmarks:user:${req.user.id}`);
     res.status(200).json({ status: 'success', message: 'Deleted' });
 });
+
 app.get('/bookmarks', authenticateToken, async (req, res) => {
-    const result = await pool.query('SELECT * FROM bookmarks WHERE user_id = $1', [req.user.id]);
+    const cacheKey = `bookmarks:user:${req.user.id}`;
+    const cached = await getCache(cacheKey);
+    if (cached) {
+        res.set('X-Data-Source', 'cache');
+        return res.status(200).json({ status: 'success', data: { bookmarks: cached } });
+    }
+
+    const query = `
+        SELECT b.id, b.user_id, b.job_id, 
+               j.company_id, j.category_id, j.title, j.description, j.job_type, j.experience_level, 
+               j.location_type, j.location_city, j.salary_min, j.salary_max, j.is_salary_visible, j.status, 
+               c.name as company_name, c.location as company_location, c.description as company_description 
+        FROM bookmarks b 
+        JOIN jobs j ON b.job_id = j.id 
+        JOIN companies c ON j.company_id = c.id 
+        WHERE b.user_id = $1`;
+        
+    const result = await pool.query(query, [req.user.id]);
+    await setCache(cacheKey, result.rows);
+    res.set('X-Data-Source', 'database');
     res.status(200).json({ status: 'success', data: { bookmarks: result.rows } });
 });
 
-// --- DOCUMENTS (Protected) ---
-app.post('/documents', authenticateToken, upload.single('document'), async (req, res, next) => {
-    if (!req.file) return next({ status: 400, message: 'File wajib diunggah' });
+app.post('/documents', authenticateToken, uploadMiddleware, async (req, res, next) => {
+    if (!req.file) return next({ status: 400, message: 'File is required' });
+    
     const id = `doc-${Date.now()}`;
     const url = `http://${req.hostname}:${process.env.PORT || 3000}/uploads/${req.file.filename}`;
     
     await pool.query('INSERT INTO documents VALUES($1, $2, $3, $4)', [id, req.user.id, req.file.filename, url]);
-    res.status(201).json({ status: 'success', data: { id, url } });
+    
+    res.status(201).json({ 
+        status: 'success', 
+        data: { 
+            documentId: id, 
+            filename: req.file.filename,
+            originalName: req.file.originalname,
+            size: req.file.size
+        } 
+    });
 });
+
 app.delete('/documents/:id', authenticateToken, async (req, res, next) => {
     const check = await pool.query('SELECT filename FROM documents WHERE id = $1', [req.params.id]);
     if (!check.rows[0]) return next({ status: 404, message: 'Not found' });
     
-    fs.unlink(path.join(__dirname, 'uploads', check.rows[0].filename), (err) => { if(err) console.error(err) });
+    const filePath = path.join(process.cwd(), 'uploads', check.rows[0].filename);
+    if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+    }
+    
     await pool.query('DELETE FROM documents WHERE id = $1', [req.params.id]);
     res.status(200).json({ status: 'success', message: 'Deleted' });
 });
 
-// --- AUTHENTICATIONS (Logout) ---
 app.delete('/authentications', authenticateToken, validate(RefreshTokenSchema), async (req, res, next) => {
     const { refreshToken } = req.body;
-
-    // Cek apakah token tersebut memang ada di database
     const check = await pool.query('SELECT token FROM authentications WHERE token = $1', [refreshToken]);
-    
-    // Jika tidak ada (karena invalid/ngasal), kembalikan error 400
-    if (!check.rows[0]) {
-        return next({ status: 400, message: 'Refresh token tidak valid di database' });
-    }
+    if (!check.rows[0]) return next({ status: 400, message: 'Refresh token tidak ditemukan di database' });
 
-    // Jika ada, baru hapus dari database
     await pool.query('DELETE FROM authentications WHERE token = $1', [refreshToken]);
     res.status(200).json({ status: 'success', message: 'Logout berhasil' });
 });
 
 // ==========================================
-// MIDDLEWARE ERROR HANDLING 
+// MIDDLEWARE ERROR HANDLING
 // ==========================================
 app.use((err, req, res, next) => {
     const statusCode = err.status || 500;

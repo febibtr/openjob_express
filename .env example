@@ -1,0 +1,25 @@
+# Database Configuration
+PGUSER=xxxx
+PGPASSWORD=xxxx
+PGDATABASE=xxxx
+PGHOST=xxxx
+PGPORT=xxxx
+
+# Server Configuration
+HOST=xxxx
+PORT=xxxx
+
+# JWT Keys 
+ACCESS_TOKEN_KEY=xxxx
+REFRESH_TOKEN_KEY=xxxx
+
+REDIS_HOST=xxxx
+RABBITMQ_HOST=xxxx
+RABBITMQ_PORT=xxxx
+RABBITMQ_USER=xxxx
+RABBITMQ_PASSWORD=xxxx
+
+MAIL_HOST=xxxx
+MAIL_PORT=xxxx
+MAIL_USER=xxxx
+MAIL_PASSWORD=pxxxx

@@ -17,6 +17,8 @@ exports.up = (pgm) => {
   pgm.createTable('categories', {
     id: { type: 'VARCHAR(50)', primaryKey: true },
     name: { type: 'TEXT', notNull: true },
+    created_at: { type: 'TIMESTAMP', notNull: true, default: pgm.func('current_timestamp') },
+    updated_at: { type: 'TIMESTAMP', notNull: true, default: pgm.func('current_timestamp') },
   });
 
   // 2. Tabel Relasional 
@@ -26,6 +28,14 @@ exports.up = (pgm) => {
     location: { type: 'TEXT', notNull: true },
     description: { type: 'TEXT' },
     owner: { type: 'VARCHAR(50)', references: '"users"', onDelete: 'cascade' },
+    created_at: { type: 'TIMESTAMP', notNull: true, default: pgm.func('current_timestamp') },
+  });
+
+  pgm.createTable('documents', {
+    id: { type: 'VARCHAR(50)', primaryKey: true },
+    user_id: { type: 'VARCHAR(50)', references: '"users"', onDelete: 'cascade' },
+    filename: { type: 'TEXT', notNull: true },
+    url: { type: 'TEXT', notNull: true },
   });
 
   pgm.createTable('jobs', {
@@ -51,6 +61,7 @@ exports.up = (pgm) => {
     job_id: { type: 'VARCHAR(50)', references: '"jobs"', onDelete: 'cascade' },
     user_id: { type: 'VARCHAR(50)', references: '"users"', onDelete: 'cascade' },
     status: { type: 'VARCHAR(20)', notNull: true, default: 'pending' },
+    created_at: { type: 'TIMESTAMP', notNull: true, default: pgm.func('current_timestamp') },
   });
 
   pgm.createTable('bookmarks', {
@@ -64,6 +75,7 @@ exports.down = (pgm) => {
   pgm.dropTable('bookmarks');
   pgm.dropTable('applications');
   pgm.dropTable('jobs');
+  pgm.dropTable('documents');
   pgm.dropTable('companies');
   pgm.dropTable('categories');
   pgm.dropTable('authentications');
